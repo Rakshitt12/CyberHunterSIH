@@ -2,6 +2,7 @@
 
 import React, { useState } from "react";
 import Link from "next/link";
+import { API_BASE_URL } from "@/config";
 import {
   UploadCloud,
   FileText,
@@ -161,7 +162,7 @@ export default function UploadPage() {
     try {
       const fd = new FormData();
       if (firFile) fd.append("file", firFile); else fd.append("text", firText);
-      const res = await fetch(`http://localhost:8000/cases/${encodeURIComponent(caseId.trim())}/upload`, { method: "POST", body: fd });
+      const res = await fetch(`${API_BASE_URL}/cases/${encodeURIComponent(caseId.trim())}/upload`, { method: "POST", body: fd });
       if (!res.ok) { const e2 = await res.json().catch(() => null); throw new Error(e2?.detail || `HTTP ${res.status}`); }
       const data: UploadResult = await res.json();
       setUploadResult(data);
@@ -197,7 +198,7 @@ export default function UploadPage() {
       const phones = uploadResult.entities.phones.map(p => ({ number: p.text }));
       const locations = uploadResult.entities.locations.map(l => ({ name: l.text }));
       const res = await fetch(
-        `http://localhost:8000/cases/${encodeURIComponent(uploadResult.case_id)}/confirm-entities`,
+        `${API_BASE_URL}/cases/${encodeURIComponent(uploadResult.case_id)}/confirm-entities`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ suspects, phones, accounts: [], locations }) }
       );
       if (!res.ok) { const e2 = await res.json().catch(() => null); throw new Error(e2?.detail || `HTTP ${res.status}`); }
@@ -226,7 +227,7 @@ export default function UploadPage() {
             </div>
           </div>
           <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-            Backend Online (8000)
+            Backend Online (8001)
           </span>
         </header>
 

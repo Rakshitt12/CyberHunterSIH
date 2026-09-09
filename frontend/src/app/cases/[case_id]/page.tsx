@@ -4,6 +4,7 @@ import React, { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import dynamic from "next/dynamic";
+import { API_BASE_URL } from "@/config";
 import {
   ArrowLeft,
   Shield,
@@ -57,9 +58,9 @@ export default function CaseDetailPage() {
       setError(null);
       try {
         const [graphRes, analyticsRes, burnerRes] = await Promise.all([
-          fetch(`http://localhost:8000/cases/${encodeURIComponent(caseId)}/graph`),
-          fetch(`http://localhost:8000/cases/${encodeURIComponent(caseId)}/analytics`),
-          fetch(`http://localhost:8000/cases/${encodeURIComponent(caseId)}/burner-phones`),
+          fetch(`${API_BASE_URL}/cases/${encodeURIComponent(caseId)}/graph`),
+          fetch(`${API_BASE_URL}/cases/${encodeURIComponent(caseId)}/analytics`),
+          fetch(`${API_BASE_URL}/cases/${encodeURIComponent(caseId)}/burner-phones`),
         ]);
 
         if (!graphRes.ok) {
