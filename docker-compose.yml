@@ -1,0 +1,37 @@
+services:
+  neo4j:
+    image: neo4j:5-community
+    container_name: cyberhunters-neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      # Set NEO4J_PASSWORD in .env (never commit real passwords to git)
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-cyberhunters123}
+      - NEO4J_PLUGINS=["graph-data-science"]
+      - NEO4J_dbms_security_procedures_unrestricted=gds.*
+      - NEO4J_dbms_security_procedures_allowlist=gds.*
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+
+  postgres:
+    image: postgres:16
+    container_name: cyberhunters-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      # Set POSTGRES_PASSWORD in .env (never commit real passwords to git)
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-cyberhunters}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  postgres_data:
+
