@@ -311,3 +311,4 @@ def merge_mentions(
         suspect=suspect,
         source_sentence=source_sentence,
     )
+

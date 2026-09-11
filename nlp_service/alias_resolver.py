@@ -98,3 +98,4 @@ def find_alias_candidates(
     # Rank highest score first
     results.sort(key=lambda r: r["score"], reverse=True)
     return results
+

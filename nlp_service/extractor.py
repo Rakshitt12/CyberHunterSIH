@@ -365,3 +365,4 @@ def extract_entities(text: str) -> List[Dict[str, Any]]:
         cleaned_entities.append(ent)
 
     return cleaned_entities
+

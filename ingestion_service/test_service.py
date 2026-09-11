@@ -268,3 +268,4 @@ def test_batch4_end_to_end_flow():
     cross_suspects = [c["identifier"] for c in analytics_data["cross_case_links"]]
     assert "Vikram Singh" in cross_suspects
 
+

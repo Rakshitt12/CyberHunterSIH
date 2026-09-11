@@ -46,3 +46,4 @@ them into one connected graph and surfaces hidden patterns automatically.
 - Build one pipeline stage at a time. Do not scaffold future stages early.
 - After each stage, run the verification yourself using your terminal access and report the result. Verification means actually running the check yourself and confirming real output — never handing testing steps back to me as manual instructions (e.g. 'open X and paste this query'), unless the check genuinely requires a GUI or my visual judgment that you cannot perform yourself.
 - If something is ambiguous, ask rather than guessing a default.
+

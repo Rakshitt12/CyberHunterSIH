@@ -231,3 +231,4 @@ def test_end_to_end():
             print(f"\n  [NEW SUSPECT] '{name}' -- no alias candidates above threshold")
 
     print("\n" + "=" * 60)
+

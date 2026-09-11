@@ -185,3 +185,4 @@ ALL_QUERIES = {
     "cycle_detection":     CYCLE_DETECTION,
     "cross_case_linking":  CROSS_CASE_LINKING,
 }
+

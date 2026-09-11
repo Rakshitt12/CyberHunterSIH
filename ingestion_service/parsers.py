@@ -149,3 +149,4 @@ def parse_bank_csv(file_bytes: bytes, filename: str) -> Dict[str, Any]:
         "record_count": len(records),
         "records": records,
     }
+
