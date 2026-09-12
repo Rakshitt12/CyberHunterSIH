@@ -90,7 +90,21 @@ class ConfirmedEntitiesRequest(BaseModel):
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "service": "ingestion_service"}
+    """Health check endpoint that verifies both service and Neo4j connectivity."""
+    db_status = "disconnected"
+    try:
+        driver = get_driver()
+        driver.verify_connectivity()
+        driver.close()
+        db_status = "connected"
+    except Exception:
+        db_status = "disconnected"
+
+    return {
+        "status": "healthy" if db_status == "connected" else "degraded",
+        "service": "ingestion_service",
+        "database": db_status,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +623,10 @@ def get_case_analytics(case_id: str):
     """
     Runs Betweenness Centrality, PageRank, Louvain Community Detection,
     Cycle Detection, and Cross-Case Linking queries, returning JSON results.
+    
+    Note: GDS algorithms (Betweenness, PageRank, Louvain) require Neo4j AuraDB
+    Professional/Enterprise with GDS or Aura Graph Analytics. On AuraDB Free,
+    only pure Cypher queries (cycle detection, cross-case linking) are available.
     """
     case_id_clean = case_id.strip()
     if not case_id_clean:
@@ -616,82 +634,102 @@ def get_case_analytics(case_id: str):
 
     driver = get_driver()
 
+    gds_available = True
+    betweenness_results = []
+    pagerank_results = []
+    communities = {}
+    gds_error = None
+
     try:
         with session_scope(driver) as session:
-            # 1. Ensure GDS projection exists
+            # Check if GDS is available
             try:
-                session.run(DROP_PROJECTION)
-            except Exception:
-                pass
-            session.run(PROJECTION)
+                session.run("CALL gds.version()")
+            except Exception as e:
+                gds_available = False
+                gds_error = str(e)
 
-            # Fetch suspects mentioned in this case
-            case_suspects_records = session.run(
-                "MATCH (c:Case {case_id: $case_id})-[:MENTIONS]->(s:Suspect) RETURN s.name AS name",
-                case_id=case_id_clean,
-            ).data()
-            case_suspect_names = {r["name"] for r in case_suspects_records if r.get("name")}
+            if gds_available:
+                # 1. Ensure GDS projection exists
+                try:
+                    session.run(DROP_PROJECTION)
+                except Exception:
+                    pass
+                session.run(PROJECTION)
 
-            # 2. Betweenness Centrality
-            bc_records = session.run(BETWEENNESS_CENTRALITY).data()
-            betweenness_results = [
-                {
-                    "nodeType": r["nodeType"],
-                    "identifier": r["identifier"],
-                    "case_id": r.get("case_id"),
-                    "score": r["betweenness_score"],
-                    "in_this_case": r["identifier"] in case_suspect_names,
-                }
-                for r in bc_records
-            ]
+                # Fetch suspects mentioned in this case
+                case_suspects_records = session.run(
+                    "MATCH (c:Case {case_id: $case_id})-[:MENTIONS]->(s:Suspect) RETURN s.name AS name",
+                    case_id=case_id_clean,
+                ).data()
+                case_suspect_names = {r["name"] for r in case_suspects_records if r.get("name")}
 
-            # 3. PageRank
-            pr_records = session.run(PAGERANK).data()
-            pagerank_results = [
-                {
-                    "nodeType": r["nodeType"],
-                    "identifier": r["identifier"],
-                    "case_id": r.get("case_id"),
-                    "score": r["pagerank_score"],
-                    "in_this_case": r["identifier"] in case_suspect_names,
-                }
-                for r in pr_records
-            ]
+                # 2. Betweenness Centrality
+                bc_records = session.run(BETWEENNESS_CENTRALITY).data()
+                betweenness_results = [
+                    {
+                        "nodeType": r["nodeType"],
+                        "identifier": r["identifier"],
+                        "case_id": r.get("case_id"),
+                        "score": r["betweenness_score"],
+                        "in_this_case": r["identifier"] in case_suspect_names,
+                    }
+                    for r in bc_records
+                ]
 
-            # 4. Louvain Community Detection
-            louvain_records = session.run(LOUVAIN_COMMUNITY).data()
-            communities = {}
-            for r in louvain_records:
-                cid = str(r["communityId"])
-                communities.setdefault(cid, []).append({
-                    "nodeType": r["nodeType"],
-                    "identifier": r["identifier"],
-                    "case_id": r.get("case_id"),
-                    "in_this_case": r["identifier"] in case_suspect_names,
-                })
+                # 3. PageRank
+                pr_records = session.run(PAGERANK).data()
+                pagerank_results = [
+                    {
+                        "nodeType": r["nodeType"],
+                        "identifier": r["identifier"],
+                        "case_id": r.get("case_id"),
+                        "score": r["pagerank_score"],
+                        "in_this_case": r["identifier"] in case_suspect_names,
+                    }
+                    for r in pr_records
+                ]
 
-            # 5. Cycle Detection (Money Laundering Rings)
-            # Deliberately scoped to relationships touching $case_id for targeted relevance and to prevent exponential combinatorial explosion across the global transaction graph.
-            cycle_query = """
-            MATCH path = (start:Account)-[:TRANSFERRED*2..6]->(start)
-            WHERE any(x IN relationships(path) WHERE x.case_id = $case_id)
-              AND all(i IN range(1, length(path) - 1) WHERE NOT nodes(path)[i] IN nodes(path)[0..i])
-              AND all(n IN nodes(path)[1..-1] WHERE start.account_number < n.account_number)
-            WITH [n IN nodes(path) | n.account_number] AS accounts,
-                 [rel IN relationships(path) | rel.amount] AS amounts,
-                 [rel IN relationships(path) | rel.case_id] AS cases,
-                 length(path) AS cycle_length
-            RETURN DISTINCT
-              accounts,
-              amounts,
-              cases,
-              cycle_length
-            ORDER BY cycle_length ASC
-            LIMIT 20
-            """
+                # 4. Louvain Community Detection
+                louvain_records = session.run(LOUVAIN_COMMUNITY).data()
+                for r in louvain_records:
+                    cid = str(r["communityId"])
+                    communities.setdefault(cid, []).append({
+                        "nodeType": r["nodeType"],
+                        "identifier": r["identifier"],
+                        "case_id": r.get("case_id"),
+                        "in_this_case": r["identifier"] in case_suspect_names,
+                    })
+            else:
+                gds_error = "GDS procedures not available on this Neo4j AuraDB tier. Requires AuraDB Professional/Enterprise with GDS or Aura Graph Analytics."
+
+    finally:
+        driver.close()
+
+    # 5. Cycle Detection (Money Laundering Rings) - Pure Cypher, no GDS required
+    cycle_query = """
+    MATCH path = (start:Account)-[:TRANSFERRED*2..6]->(start)
+    WHERE any(x IN relationships(path) WHERE x.case_id = $case_id)
+      AND all(i IN range(1, length(path) - 1) WHERE NOT nodes(path)[i] IN nodes(path)[0..i])
+      AND all(n IN nodes(path)[1..-1] WHERE start.account_number < n.account_number)
+    WITH [n IN nodes(path) | n.account_number] AS accounts,
+         [rel IN relationships(path) | rel.amount] AS amounts,
+         [rel IN relationships(path) | rel.case_id] AS cases,
+         length(path) AS cycle_length
+    RETURN DISTINCT
+      accounts,
+      amounts,
+      cases,
+      cycle_length
+    ORDER BY cycle_length ASC
+    LIMIT 20
+    """
+    driver = get_driver()
+    try:
+        with session_scope(driver) as session:
             cycle_records = session.run(cycle_query, case_id=case_id_clean).data()
 
-            # 6. Cross-Case Linking for entities in this case
+            # 6. Cross-Case Linking for entities in this case - Pure Cypher, no GDS required
             cross_case_query = """
             MATCH (c:Case {case_id: $case_id})-[:MENTIONS]->(s:Suspect)
             MATCH (c_other:Case)-[:MENTIONS]->(s)
@@ -701,13 +739,12 @@ def get_case_analytics(case_id: str):
             RETURN 'Suspect' AS entityType, s.name AS identifier, other_cases, size(other_cases) + 1 AS total_cases
             """
             cross_case_records = session.run(cross_case_query, case_id=case_id_clean).data()
-
     finally:
         driver.close()
 
     burner_info = get_burner_phones(case_id_clean)
 
-    return {
+    response = {
         "case_id": case_id_clean,
         "betweenness_centrality": betweenness_results,
         "pagerank": pagerank_results,
@@ -716,6 +753,11 @@ def get_case_analytics(case_id: str):
         "cross_case_links": cross_case_records,
         "burner_phones": burner_info.get("flagged_phones", []),
     }
+
+    if not gds_available:
+        response["gds_warning"] = gds_error
+
+    return response
 
 
 # ---------------------------------------------------------------------------

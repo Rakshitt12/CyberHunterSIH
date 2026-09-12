@@ -17,29 +17,92 @@ previous case's evidence.  The MENTIONS relationship is distinct per
 """
 
 import os
+import ssl
 from contextlib import contextmanager
 from typing import Optional
 from neo4j import GraphDatabase, Driver, Session
+
+try:
+    from dotenv import load_dotenv, find_dotenv
+    _dotenv_path = find_dotenv(
+        filename=".env",
+        raise_error_if_not_found=False,
+        usecwd=True,
+    )
+    if _dotenv_path:
+        load_dotenv(_dotenv_path)
+    else:
+        _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        _candidate = os.path.join(_project_root, ".env")
+        if os.path.isfile(_candidate):
+            load_dotenv(_candidate)
+except ImportError:
+    pass
 
 # ---------------------------------------------------------------------------
 # Connection management
 # Credentials are read from environment variables so that nothing sensitive
 # is ever hardcoded in source.  For local development, copy .env.example to
-# .env and fill in the values — or let the defaults below apply.
+# .env and fill in the values.
 # ---------------------------------------------------------------------------
 
-_DEFAULT_URI  = os.environ.get("NEO4J_URI",      "bolt://localhost:7687")
-_DEFAULT_USER = os.environ.get("NEO4J_USER",     "neo4j")
-_DEFAULT_PASS = os.environ.get("NEO4J_PASSWORD", "cyberhunters123")
+_URI  = os.environ.get("NEO4J_URI")
+_USER = os.environ.get("NEO4J_USER")
+_PASS = os.environ.get("NEO4J_PASSWORD")
+
+if not _URI:
+    raise RuntimeError("NEO4J_URI environment variable is not set. Copy .env.example to .env and configure.")
+if not _USER:
+    raise RuntimeError("NEO4J_USER environment variable is not set. Copy .env.example to .env and configure.")
+if not _PASS:
+    raise RuntimeError("NEO4J_PASSWORD environment variable is not set. Copy .env.example to .env and configure.")
+
+
+def _create_ssl_context() -> ssl.SSLContext:
+    """
+    Create an SSL context that trusts the system CA bundle plus certifi's CA bundle.
+    This ensures Neo4j AuraDB certificates are trusted on Windows.
+    """
+    ctx = ssl.create_default_context()
+    # certifi provides Mozilla's CA bundle which includes the CAs used by AuraDB
+    try:
+        import certifi
+        ctx.load_verify_locations(certifi.where())
+    except ImportError:
+        # Fall back to system default if certifi not available
+        pass
+    return ctx
+
+
+def _normalize_uri_for_ssl(uri: str) -> tuple[str, dict]:
+    """
+    Normalize URI scheme for SSL configuration.
+    
+    For AuraDB (neo4j+s://), we convert to neo4j:// with encrypted=True and custom SSL context
+    to ensure certificate verification works on Windows where system CA bundle
+    may be incomplete.
+    """
+    ssl_context = _create_ssl_context()
+    
+    if uri.startswith("neo4j+s://"):
+        # Convert to neo4j:// with encrypted=True and custom SSL context
+        return uri.replace("neo4j+s://", "neo4j://", 1), {"encrypted": True, "ssl_context": ssl_context}
+    elif uri.startswith("bolt+s://"):
+        # Convert to bolt:// with encrypted=True and custom SSL context
+        return uri.replace("bolt+s://", "bolt://", 1), {"encrypted": True, "ssl_context": ssl_context}
+    
+    # For other schemes, use as-is
+    return uri, {}
 
 
 def get_driver(
-    uri:      str = _DEFAULT_URI,
-    user:     str = _DEFAULT_USER,
-    password: str = _DEFAULT_PASS,
+    uri:      str = _URI,
+    user:     str = _USER,
+    password: str = _PASS,
 ) -> Driver:
-    """Return a verified Neo4j driver instance."""
-    driver = GraphDatabase.driver(uri, auth=(user, password))
+    """Return a verified Neo4j driver instance configured for AuraDB."""
+    normalized_uri, driver_config = _normalize_uri_for_ssl(uri)
+    driver = GraphDatabase.driver(normalized_uri, auth=(user, password), **driver_config)
     driver.verify_connectivity()
     return driver
 

@@ -1,0 +1,43 @@
+{
+  "suspects": [
+    {
+      "name": "Vikram Singh",
+      "source_sentence": "The caller identified himself as Vikram alias 'Vicky' operating from Sector 18, Noida.",
+      "alias": "Vicky"
+    },
+    {
+      "name": "Suresh Kumar",
+      "source_sentence": "Subsequent investigation revealed that Vicky was seen in Rohini, Delhi, coordinating with an associate named Suresh using mobile number +919123456789.",
+      "alias": null
+    }
+  ],
+  "phones": [
+    {
+      "number": "+919876543210",
+      "owner": "Vikram Singh"
+    },
+    {
+      "number": "+919123456789",
+      "owner": "Suresh Kumar"
+    }
+  ],
+  "accounts": [
+    {
+      "account_number": "ACC99887766",
+      "bank_name": "City Union Bank",
+      "owner": "Vikram Singh"
+    }
+  ],
+  "locations": [
+    {
+      "name": "Sector 18, Noida",
+      "region": "UP",
+      "suspect": "Vikram Singh"
+    },
+    {
+      "name": "Rohini, Delhi",
+      "region": "Delhi",
+      "suspect": "Suresh Kumar"
+    }
+  ]
+}
