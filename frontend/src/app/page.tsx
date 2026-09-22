@@ -2,7 +2,8 @@
 
 import React, { useEffect, useState, useMemo } from "react";
 import Link from "next/link";
-import { API_BASE_URL } from "@/config";
+import { getCases, getDocuments, getHealth } from "@/api/client";
+import type { HealthStatus } from "@/api/types";
 import {
   FolderOpen,
   ShieldCheck,
@@ -24,6 +25,8 @@ interface CaseSummary {
 
 export default function DashboardPage() {
   const [cases, setCases] = useState<CaseSummary[]>([]);
+  const [health, setHealth] = useState<HealthStatus | null>(null);
+  const [evidenceCases, setEvidenceCases] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
@@ -32,12 +35,14 @@ export default function DashboardPage() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE_URL}/cases`);
-      if (!res.ok) {
-        throw new Error(`Failed to fetch cases (HTTP ${res.status})`);
-      }
-      const data = await res.json();
-      setCases(data.cases || []);
+      const [caseData, healthData, docData] = await Promise.all([
+        getCases(),
+        getHealth().catch(() => null),
+        getDocuments().catch(() => ({ documents: [] as never[] })),
+      ]);
+      setCases(caseData.cases || []);
+      setHealth(healthData);
+      setEvidenceCases(docData.documents?.length ?? 0);
     } catch (err: any) {
       setError(err.message || "Failed to connect to backend service.");
     } finally {
@@ -85,7 +90,7 @@ export default function DashboardPage() {
           <h2>INVESTIGATION DASHBOARD</h2>
           <p>
             High-level command register for criminal-network investigations. All previously ingested
-            cases are tracked below in graph storage with evidence provenance and GDS analytics.
+            cases are tracked below in graph storage with evidence provenance and graph analytics.
           </p>
         </div>
         <div className="case-id-block">
@@ -111,10 +116,19 @@ export default function DashboardPage() {
         <div className="ledger-card status-card">
           <div className="card-code">02 // GRAPH DATABASE</div>
           <div className="status-row" style={{ margin: "14px 0 10px" }}>
-            <span className="status-dot" />
-            <span className="text-xs font-mono">NEO4J CE + GDS</span>
+            <span
+              className="status-dot"
+              style={
+                health?.database === "connected"
+                  ? undefined
+                  : { background: "var(--alert)" }
+              }
+            />
+            <span className="text-xs font-mono">
+              NEO4J — {(health?.database ?? "UNKNOWN").toUpperCase()}
+            </span>
           </div>
-          <p className="muted-copy">Port 7687 / Bolt protocol verified.</p>
+          <p className="muted-copy">Analytics engine // Auto: GDS / Local.</p>
         </div>
 
         <div className="ledger-card integrity-card">
@@ -123,10 +137,20 @@ export default function DashboardPage() {
             <ShieldCheck size={15} />
           </div>
           <div className="dashboard-metric">
-            <span style={{ color: "var(--green)" }}>100%</span>
-            <label>EVIDENCE LINKED</label>
+            <span style={{ color: "var(--green)" }}>
+              {loading
+                ? "..."
+                : cases.length === 0
+                  ? "—"
+                  : `${Math.round((evidenceCases / cases.length) * 100)}%`}
+            </span>
+            <label>CASES WITH EVIDENCE</label>
           </div>
-          <p className="muted-copy">Per-case source sentence guarantee.</p>
+          <p className="muted-copy">
+            {loading
+              ? "Computing coverage..."
+              : `${evidenceCases} of ${cases.length} cases carry persisted evidence.`}
+          </p>
         </div>
 
         <div className="ledger-card metric-list">

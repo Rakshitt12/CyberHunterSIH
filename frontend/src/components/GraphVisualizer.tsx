@@ -2,27 +2,24 @@
 
 import React, { useEffect, useRef } from "react";
 import cytoscape from "cytoscape";
-
-interface NodeData {
-  id: string;
-  label: string;
-  name: string;
-  properties: Record<string, any>;
-}
-
-interface EdgeData {
-  id: string;
-  source: string;
-  target: string;
-  type: string;
-  properties: Record<string, any>;
-}
+import type { GraphEdge as EdgeData, GraphNode as NodeData } from "@/api/types";
 
 interface GraphVisualizerProps {
   nodes: NodeData[];
   edges: EdgeData[];
   onSelectNode: (node: NodeData | null) => void;
   selectedNodeId?: string | null;
+  // Edge inspection (§13): tap an edge to open the Relationship Inspector.
+  onSelectEdge?: (edge: EdgeData | null) => void;
+  selectedEdgeId?: string | null;
+  // Graph controls (§12): null = show all.
+  nodeTypeFilter?: string[] | null;
+  edgeTypeFilter?: string[] | null;
+  // Focus a node by id (centers + selects). Consumed via focusSignal bumps.
+  focusId?: string | null;
+  focusSignal?: number;
+  // Increment to FIT the viewport to visible elements.
+  fitSignal?: number;
 }
 
 // Fixed color scheme per node type
@@ -40,9 +37,22 @@ export default function GraphVisualizer({
   edges,
   onSelectNode,
   selectedNodeId,
+  onSelectEdge,
+  selectedEdgeId,
+  nodeTypeFilter,
+  edgeTypeFilter,
+  focusId,
+  focusSignal,
+  fitSignal,
 }: GraphVisualizerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const cyRef = useRef<cytoscape.Core | null>(null);
+  // Callback refs: event handlers registered once at init always call
+  // the latest props without re-creating the Cytoscape instance.
+  const selectNodeRef = useRef(onSelectNode);
+  selectNodeRef.current = onSelectNode;
+  const selectEdgeRef = useRef(onSelectEdge);
+  selectEdgeRef.current = onSelectEdge;
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -141,6 +151,17 @@ export default function GraphVisualizer({
             width: 2.5,
           },
         },
+        {
+          selector: "edge:selected",
+          style: {
+            "line-color": "#f8fafc",
+            "target-arrow-color": "#f8fafc",
+            width: 3.5,
+            "underlay-color": "#38bdf8",
+            "underlay-padding": 4,
+            "underlay-opacity": 0.5,
+          },
+        },
       ],
       layout: {
         name: "cose",
@@ -157,13 +178,23 @@ export default function GraphVisualizer({
     cy.on("tap", "node", (evt) => {
       const node = evt.target;
       const rawData = node.data("raw");
-      onSelectNode(rawData || null);
+      selectEdgeRef.current?.(null);
+      selectNodeRef.current(rawData || null);
+    });
+
+    // Handle edge selection → Relationship Inspector
+    cy.on("tap", "edge", (evt) => {
+      const edge = evt.target;
+      const rawData = edge.data("raw");
+      selectNodeRef.current(null);
+      selectEdgeRef.current?.(rawData || null);
     });
 
     // Handle clicking the background
     cy.on("tap", (evt) => {
       if (evt.target === cy) {
-        onSelectNode(null);
+        selectNodeRef.current(null);
+        selectEdgeRef.current?.(null);
       }
     });
 
@@ -174,18 +205,71 @@ export default function GraphVisualizer({
     };
   }, [nodes, edges]);
 
-  // Update selection highlight when selectedNodeId changes
+  // Update selection highlight when selectedNodeId / selectedEdgeId change
   useEffect(() => {
     if (!cyRef.current) return;
     const cy = cyRef.current;
-    cy.nodes().unselect();
+    cy.elements().unselect();
     if (selectedNodeId) {
       const node = cy.getElementById(selectedNodeId);
-      if (node) {
+      if (node && node.isNode()) {
         node.select();
       }
     }
-  }, [selectedNodeId]);
+    if (selectedEdgeId) {
+      const edge = cy.getElementById(selectedEdgeId);
+      if (edge && edge.isEdge()) {
+        edge.select();
+      }
+    }
+  }, [selectedNodeId, selectedEdgeId]);
+
+  // Apply entity / relationship type filters (§12)
+  useEffect(() => {
+    if (!cyRef.current) return;
+    const cy = cyRef.current;
+    cy.batch(() => {
+      cy.nodes().forEach((n) => {
+        const show =
+          !nodeTypeFilter || nodeTypeFilter.length === 0
+            ? true
+            : nodeTypeFilter.includes(n.data("label"));
+        n.style("display", show ? "element" : "none");
+      });
+      cy.edges().forEach((e) => {
+        const typeOk =
+          !edgeTypeFilter || edgeTypeFilter.length === 0
+            ? true
+            : edgeTypeFilter.includes(e.data("label"));
+        const endsVisible =
+          e.source().style("display") !== "none" &&
+          e.target().style("display") !== "none";
+        e.style("display", typeOk && endsVisible ? "element" : "none");
+      });
+    });
+  }, [nodeTypeFilter, edgeTypeFilter, nodes, edges]);
+
+  // Focus a node (§12): center viewport + select + notify
+  useEffect(() => {
+    if (!cyRef.current || !focusId || focusSignal === undefined) return;
+    const cy = cyRef.current;
+    const node = cy.getElementById(focusId);
+    if (node && node.isNode()) {
+      node.style("display", "element");
+      cy.center(node);
+      node.select();
+      selectEdgeRef.current?.(null);
+      selectNodeRef.current(node.data("raw") || null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusSignal]);
+
+  // FIT viewport (§12)
+  useEffect(() => {
+    if (!cyRef.current || fitSignal === undefined || fitSignal === 0) return;
+    cyRef.current.fit(undefined, 40);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fitSignal]);
 
   return (
     <div className="relative w-full h-full min-h-[550px] bg-[#141817] border border-[rgba(200,200,186,0.25)] overflow-hidden">
@@ -211,7 +295,7 @@ export default function GraphVisualizer({
 
       <div className="canvas-footer" style={{ position: "absolute", bottom: 0, left: 0, right: 0, background: "rgba(18,21,20,0.9)", borderTop: "1px solid rgba(200,200,186,0.12)" }}>
         <span>GRAPH INTERACTION: SCROLL ZOOM // DRAG PAN</span>
-        <span>CLICK NODE FOR PROOF-OF-SOURCE</span>
+        <span>CLICK NODE OR EDGE TO INSPECT</span>
       </div>
     </div>
   );

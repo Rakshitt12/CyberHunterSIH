@@ -2,7 +2,13 @@
 
 import React, { useState, ChangeEvent, FormEvent } from "react";
 import Link from "next/link";
-import { API_BASE_URL } from "@/config";
+import { confirmEntities, uploadCaseDocument } from "@/api/client";
+import type {
+  AliasCandidate,
+  ExtractedEntity,
+  UploadResult,
+} from "@/api/client";
+import { CsvIntake } from "@/components/intake";
 import {
   Upload,
   FileText,
@@ -23,37 +29,8 @@ import {
   ChevronRight,
 } from "lucide-react";
 
-// ─── Types mirroring the API response ────────────────────────────────────────
-interface ExtractedEntity {
-  text: string;
-  label: string;
-  source_sentence: string;
-  start_char: number;
-  end_char: number;
-  role?: string;
-}
-
-interface AliasCandidate {
-  candidate: string;
-  score: number;
-  scorer_used: string;
-  action_required: string;
-}
-
-interface UploadResult {
-  status: string;
-  case_id: string;
-  raw_text_length: number;
-  entities: {
-    suspects: ExtractedEntity[];
-    complainants: ExtractedEntity[];
-    phones: ExtractedEntity[];
-    locations: ExtractedEntity[];
-    amounts: ExtractedEntity[];
-  };
-  alias_candidates: Record<string, AliasCandidate[]>;
-  message: string;
-}
+// Shared API types imported from @/api/client (UploadResult,
+// ExtractedEntity, AliasCandidate). Below: ingest-local UI state only.
 
 // "approved" = investigator confirmed merge, "rejected" = dismissed, null = pending
 type AliasDecision = "approved" | "rejected" | null;
@@ -132,6 +109,7 @@ function AliasCandidateRow({
 }
 
 export default function IngestPage() {
+  const [tab, setTab] = useState<"FIR" | "CDR" | "BANK">("FIR");
   const [caseId, setCaseId] = useState("CASE-2026-DEL-101");
   const [firFile, setFirFile] = useState<File | null>(null);
   const [firText, setFirText] = useState("");
@@ -151,11 +129,11 @@ export default function IngestPage() {
     setLoading(true); setError(null); setUploadResult(null);
     setConfirmResult(null); setConfirmError(null); setAliasDecisions({});
     try {
-      const fd = new FormData();
-      if (firFile) fd.append("file", firFile); else fd.append("text", firText);
-      const res = await fetch(`${API_BASE_URL}/cases/${encodeURIComponent(caseId.trim())}/upload`, { method: "POST", body: fd });
-      if (!res.ok) { const e2 = await res.json().catch(() => null); throw new Error(e2?.detail || `HTTP ${res.status}`); }
-      const data: UploadResult = await res.json();
+      const data = await uploadCaseDocument(
+        caseId.trim(),
+        firFile,
+        firText
+      );
       setUploadResult(data);
       const init: AliasDecisionMap = {};
       for (const [name, cands] of Object.entries(data.alias_candidates ?? {})) {
@@ -188,12 +166,13 @@ export default function IngestPage() {
       });
       const phones = uploadResult.entities.phones.map(p => ({ number: p.text }));
       const locations = uploadResult.entities.locations.map(l => ({ name: l.text }));
-      const res = await fetch(
-        `${API_BASE_URL}/cases/${encodeURIComponent(uploadResult.case_id)}/confirm-entities`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ suspects, phones, accounts: [], locations }) }
-      );
-      if (!res.ok) { const e2 = await res.json().catch(() => null); throw new Error(e2?.detail || `HTTP ${res.status}`); }
-      setConfirmResult(await res.json());
+      const data = await confirmEntities(uploadResult.case_id, {
+        suspects,
+        phones,
+        accounts: [],
+        locations,
+      });
+      setConfirmResult(data);
     } catch (err: any) {
       setConfirmError(err.message || "Confirmation failed.");
     } finally { setConfirming(false); }
@@ -220,6 +199,19 @@ export default function IngestPage() {
         </div>
       </section>
 
+      <div className="ingestion-tabs">
+        {(["FIR", "CDR", "BANK"] as const).map((t) => (
+          <button
+            key={t}
+            className={`ingestion-tab${tab === t ? " active" : ""}`}
+            onClick={() => setTab(t)}
+          >
+            {t}
+          </button>
+        ))}
+      </div>
+
+      {tab === "FIR" ? (
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         {/* ── Upload Form ────────────────────────────────────────────────── */}
         <div className="lg:col-span-5 intake-panel" style={{ margin: 0, maxWidth: "100%" }}>
@@ -564,6 +556,19 @@ export default function IngestPage() {
           )}
         </div>
       </div>
+      ) : tab === "CDR" ? (
+        <CsvIntake
+          kind="CDR"
+          hint="Call Detail Records persist immediately as CALLED links between phone nodes (MERGE — re-upload safe). Review the parsed rows, then open the case."
+          columns={["caller", "callee", "timestamp", "duration"]}
+        />
+      ) : (
+        <CsvIntake
+          kind="BANK"
+          hint="Bank transactions persist immediately as TRANSFERRED links between account nodes (MERGE — re-upload safe). Review the parsed rows, then open the case."
+          columns={["sender", "receiver", "amount", "date"]}
+        />
+      )}
     </div>
   );
 }
