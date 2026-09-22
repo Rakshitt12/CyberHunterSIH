@@ -541,23 +541,33 @@ def get_case_graph(case_id: str):
     """
 
     # -----------------------------------------------------------------------
-    # Query 2: fetch ownership and location relationships for suspects in
-    # this case, plus the Phone / Account / Location nodes they connect to.
+    # Query 2a/2b: ownership and location relationships for suspects in
+    # this case. Kept as two separate queries on purpose: combining two
+    # OPTIONAL MATCH branches in one query multiplies rows (cartesian
+    # product) and used to emit duplicate logical edges.
     # -----------------------------------------------------------------------
-    related_cypher = """
-    MATCH (c:Case {case_id: $case_id})-[:MENTIONS]->(s:Suspect)
-    OPTIONAL MATCH (s)-[r_owns:OWNS]->(target)
-    OPTIONAL MATCH (s)-[r_loc:LOCATED_AT]->(loc:Location)
-    RETURN s, r_owns, target, r_loc, loc
+    owns_cypher = """
+    MATCH (c:Case {case_id: $case_id})-[:MENTIONS]->(s:Suspect)-[r_owns:OWNS]->(target)
+    RETURN s, r_owns, target
+    """
+
+    located_cypher = """
+    MATCH (c:Case {case_id: $case_id})-[:MENTIONS]->(s:Suspect)-[r_loc:LOCATED_AT]->(loc:Location)
+    RETURN s, r_loc, loc
     """
 
     # -----------------------------------------------------------------------
-    # Query 3: CDR and bank transactions that are tagged to this case.
+    # Query 3a/3b: CDR and bank transactions tagged to this case.
+    # Separate queries for the same row-multiplication reason as above.
     # -----------------------------------------------------------------------
-    tx_cypher = """
-    OPTIONAL MATCH (p1:Phone)-[r_call:CALLED {case_id: $case_id}]->(p2:Phone)
-    OPTIONAL MATCH (a1:Account)-[r_tx:TRANSFERRED {case_id: $case_id}]->(a2:Account)
-    RETURN p1, r_call, p2, a1, r_tx, a2
+    calls_cypher = """
+    MATCH (p1:Phone)-[r_call:CALLED {case_id: $case_id}]->(p2:Phone)
+    RETURN p1, r_call, p2
+    """
+
+    transfers_cypher = """
+    MATCH (a1:Account)-[r_tx:TRANSFERRED {case_id: $case_id}]->(a2:Account)
+    RETURN a1, r_tx, a2
     """
 
     def _clean_props(node_or_rel) -> dict:
@@ -588,9 +598,14 @@ def get_case_graph(case_id: str):
             "properties": props,
         }
 
+    seen_rel_ids = set()
+
     def _add_rel(r):
-        if r is None:
+        # Deduplicate on Neo4j relationship element_id: the same logical
+        # edge must never appear twice even if query rows overlap.
+        if r is None or r.element_id in seen_rel_ids:
             return
+        seen_rel_ids.add(r.element_id)
         props = _clean_props(r)
         edges_list.append({
             "id": r.element_id,
@@ -615,30 +630,29 @@ def get_case_graph(case_id: str):
                 _add_node(s, extra_props={"source_sentence": src} if src else {})
                 _add_rel(r_m)
 
-            # --- Ownership & location relationships ---
-            for record in session.run(related_cypher, case_id=case_id_clean):
+            # --- Ownership relationships ---
+            for record in session.run(owns_cypher, case_id=case_id_clean):
                 _add_node(record["s"])
                 _add_node(record.get("target"))
-                _add_node(record.get("loc"))
-                r_owns = record.get("r_owns")
-                r_loc  = record.get("r_loc")
-                if r_owns:
-                    _add_rel(r_owns)
-                if r_loc:
-                    _add_rel(r_loc)
+                _add_rel(record.get("r_owns"))
 
-            # --- CDR / bank transactions ---
-            for record in session.run(tx_cypher, case_id=case_id_clean):
+            # --- Location relationships ---
+            for record in session.run(located_cypher, case_id=case_id_clean):
+                _add_node(record["s"])
+                _add_node(record.get("loc"))
+                _add_rel(record.get("r_loc"))
+
+            # --- CDR calls ---
+            for record in session.run(calls_cypher, case_id=case_id_clean):
                 _add_node(record.get("p1"))
                 _add_node(record.get("p2"))
+                _add_rel(record.get("r_call"))
+
+            # --- Bank transfers ---
+            for record in session.run(transfers_cypher, case_id=case_id_clean):
                 _add_node(record.get("a1"))
                 _add_node(record.get("a2"))
-                r_call = record.get("r_call")
-                r_tx   = record.get("r_tx")
-                if r_call:
-                    _add_rel(r_call)
-                if r_tx:
-                    _add_rel(r_tx)
+                _add_rel(record.get("r_tx"))
 
     finally:
         driver.close()
@@ -845,27 +859,39 @@ def get_burner_phones(
     if not case_id_clean:
         raise HTTPException(status_code=400, detail="case_id must not be empty.")
 
-    # Fetch all CALLED edges for this case, grouped by the calling phone.
-    # We read timestamps as strings here so they survive serialisation regardless
-    # of whether Neo4j stores them as DateTime objects or ISO-string properties.
-    cdr_query = """
-    MATCH (p:Phone)-[r:CALLED {case_id: $case_id}]->(p2:Phone)
-    RETURN p.number AS caller, r.timestamp AS ts, p2.number AS callee
-    ORDER BY caller, ts
-    """
     driver = get_driver()
     try:
         with session_scope(driver) as session:
-            rows = session.run(cdr_query, case_id=case_id_clean).data()
+            rows = _fetch_cdr_rows(session, case_id_clean)
     finally:
         driver.close()
 
+    return {
+        "case_id": case_id_clean,
+        "rule": f">{burst_call_threshold} calls within the first {burst_window_hours}h, then zero calls after",
+        "flagged_phones": _detect_burners(rows, burst_call_threshold, burst_window_hours),
+    }
+
+
+_BURNER_CDR_QUERY = """
+MATCH (p:Phone)-[r:CALLED {case_id: $case_id}]->(p2:Phone)
+RETURN p.number AS caller, r.timestamp AS ts, p2.number AS callee
+ORDER BY caller, ts
+"""
+
+
+def _fetch_cdr_rows(session, case_id: str):
+    """Fetch all CALLED edges for a case on an already-open session."""
+    # We read timestamps as strings here so they survive serialisation regardless
+    # of whether Neo4j stores them as DateTime objects or ISO-string properties.
+    return session.run(_BURNER_CDR_QUERY, case_id=case_id).data()
+
+
+def _detect_burners(rows, burst_call_threshold: int, burst_window_hours: int):
+    """Pure rule evaluation over CDR rows (no I/O) — shared by the
+    per-case endpoint and the global /alerts aggregation."""
     if not rows:
-        return {
-            "case_id": case_id_clean,
-            "rule": f">{burst_call_threshold} calls within the first {burst_window_hours}h, then zero calls after",
-            "flagged_phones": [],
-        }
+        return []
 
     # Group calls by caller
     from collections import defaultdict
@@ -936,11 +962,513 @@ def get_burner_phones(
                 ),
             })
 
+    return flagged
+
+
+# ---------------------------------------------------------------------------
+# Investigation modules: search, paths, timeline, documents, alerts,
+# global cross-case intel. All are database-backed plain-Cypher queries —
+# no invented data, no full-DB downloads to the browser.
+# ---------------------------------------------------------------------------
+
+@app.get("/search")
+def search_entities(q: str, entity_type: Optional[str] = None):
+    """
+    Database-backed investigation search with partial matching.
+    Searches suspect names/aliases, phone numbers, account numbers,
+    locations and case IDs. Each hit reports WHY it matched and which
+    cases it belongs to.
+    """
+    needle = (q or "").strip()
+    if len(needle) < 2:
+        raise HTTPException(status_code=400, detail="Search query must be at least 2 characters.")
+    et = (entity_type or "").strip().lower() or None
+    if et and et not in ("suspect", "phone", "account", "location", "case"):
+        raise HTTPException(status_code=400, detail="entity_type must be suspect, phone, account, location or case.")
+
+    driver = get_driver()
+    results = []
+    try:
+        with session_scope(driver) as session:
+            if et in (None, "suspect"):
+                for r in session.run(
+                    """
+                    MATCH (c:Case)-[m:MENTIONS]->(s:Suspect)
+                    WHERE toLower(s.name) CONTAINS toLower($q)
+                       OR (s.alias IS NOT NULL AND toLower(s.alias) CONTAINS toLower($q))
+                    WITH s,
+                         collect(DISTINCT c.case_id) AS cases,
+                         collect(DISTINCT m.source_sentence)[0..3] AS evidence
+                    RETURN s.name AS name, s.alias AS alias, cases, evidence
+                    LIMIT 25
+                    """,
+                    q=needle,
+                ).data():
+                    matched = []
+                    if needle.lower() in (r["name"] or "").lower():
+                        matched.append("NAME")
+                    if r.get("alias") and needle.lower() in r["alias"].lower():
+                        matched.append("ALIAS")
+                    results.append({
+                        "entity_type": "suspect",
+                        "identifier": r["name"],
+                        "alias": r.get("alias"),
+                        "matched_by": matched or ["NAME"],
+                        "cases": r["cases"],
+                        "evidence_count": len(r["evidence"] or []),
+                    })
+            if et in (None, "phone"):
+                for r in session.run(
+                    """
+                    MATCH (s:Suspect)-[o:OWNS]->(p:Phone)
+                    WHERE p.number CONTAINS $q
+                    WITH p, collect(DISTINCT o.case_id) AS cases,
+                         collect(DISTINCT s.name)[0..5] AS owners
+                    RETURN p.number AS number, cases, owners
+                    LIMIT 25
+                    """,
+                    q=needle,
+                ).data():
+                    results.append({
+                        "entity_type": "phone",
+                        "identifier": r["number"],
+                        "matched_by": ["PHONE"],
+                        "cases": [c for c in r["cases"] if c],
+                        "owners": r["owners"],
+                    })
+            if et in (None, "account"):
+                for r in session.run(
+                    """
+                    MATCH (s:Suspect)-[o:OWNS]->(a:Account)
+                    WHERE toLower(a.account_number) CONTAINS toLower($q)
+                    WITH a, collect(DISTINCT o.case_id) AS cases,
+                         collect(DISTINCT s.name)[0..5] AS owners
+                    RETURN a.account_number AS number, a.bank_name AS bank, cases, owners
+                    LIMIT 25
+                    """,
+                    q=needle,
+                ).data():
+                    results.append({
+                        "entity_type": "account",
+                        "identifier": r["number"],
+                        "bank_name": r.get("bank"),
+                        "matched_by": ["ACCOUNT"],
+                        "cases": [c for c in r["cases"] if c],
+                        "owners": r["owners"],
+                    })
+            if et in (None, "location"):
+                for r in session.run(
+                    """
+                    MATCH (s:Suspect)-[o:LOCATED_AT]->(l:Location)
+                    WHERE toLower(l.name) CONTAINS toLower($q)
+                    WITH l, collect(DISTINCT o.case_id) AS cases,
+                         collect(DISTINCT s.name)[0..5] AS suspects
+                    RETURN l.name AS name, cases, suspects
+                    LIMIT 25
+                    """,
+                    q=needle,
+                ).data():
+                    results.append({
+                        "entity_type": "location",
+                        "identifier": r["name"],
+                        "matched_by": ["LOCATION"],
+                        "cases": [c for c in r["cases"] if c],
+                        "suspects": r["suspects"],
+                    })
+            if et in (None, "case"):
+                for r in session.run(
+                    """
+                    MATCH (c:Case)
+                    WHERE toLower(c.case_id) CONTAINS toLower($q)
+                    OPTIONAL MATCH (c)-[m:MENTIONS]->(s:Suspect)
+                    WITH c, count(DISTINCT s) AS suspects
+                    RETURN c.case_id AS case_id, c.description AS description, suspects
+                    LIMIT 25
+                    """,
+                    q=needle,
+                ).data():
+                    results.append({
+                        "entity_type": "case",
+                        "identifier": r["case_id"],
+                        "description": r.get("description"),
+                        "matched_by": ["CASE_ID"],
+                        "cases": [r["case_id"]],
+                        "suspect_count": r["suspects"],
+                    })
+    finally:
+        driver.close()
+
+    return {"query": needle, "result_count": len(results), "results": results}
+
+
+@app.get("/paths")
+def find_connection(
+    from_type: str,
+    from_id: str,
+    to_type: str,
+    to_id: str,
+    max_depth: int = 6,
+):
+    """
+    Finds a graph path between two entities using Neo4j traversal.
+    Entity types: suspect, phone, account, location.
+    Returns the single shortest path, or a clear NO-connection result.
+    Nothing is invented: no path means no path.
+    """
+    valid = ("suspect", "phone", "account", "location")
+    ft, tt = (from_type or "").strip().lower(), (to_type or "").strip().lower()
+    if ft not in valid or tt not in valid:
+        raise HTTPException(status_code=400, detail="from_type/to_type must be suspect, phone, account or location.")
+    fid, tid = (from_id or "").strip(), (to_id or "").strip()
+    if not fid or not tid:
+        raise HTTPException(status_code=400, detail="from_id and to_id must not be empty.")
+    depth = max(1, min(int(max_depth), 8))
+
+    key_prop = {"suspect": "name", "phone": "number", "account": "account_number", "location": "name"}
+    label = {"suspect": "Suspect", "phone": "Phone", "account": "Account", "location": "Location"}
+
+    driver = get_driver()
+    try:
+        with session_scope(driver) as session:
+            # NOTE: iterate records directly — .data() flattens Path
+            # objects into plain node lists and drops relationships.
+            record = None
+            for rec in session.run(
+                f"""
+                MATCH (a:{label[ft]}), (b:{label[tt]})
+                WHERE a.{key_prop[ft]} = $fid AND b.{key_prop[tt]} = $tid
+                WITH a, b
+                MATCH path = shortestPath((a)-[*..{depth}]-(b))
+                RETURN path
+                LIMIT 1
+                """,
+                fid=fid,
+                tid=tid,
+            ):
+                record = rec
+                break
+            path = record["path"] if record is not None else None
+    finally:
+        driver.close()
+
+    if path is None:
+        return {
+            "found": False,
+            "from": {"entity_type": ft, "identifier": fid},
+            "to": {"entity_type": tt, "identifier": tid},
+            "message": "NO CONNECTION FOUND between these entities within the search depth.",
+        }
+
+    nodes_out, edges_out = [], []
+    for n in path.nodes:
+        labels = list(n.labels)
+        props = dict(n)
+        nodes_out.append({
+            "id": n.element_id,
+            "label": labels[0] if labels else "Node",
+            "name": props.get("name") or props.get("number")
+                    or props.get("account_number") or props.get("case_id") or "Node",
+            "properties": {k: (str(v) if hasattr(v, "iso_format") or hasattr(v, "to_native") else v)
+                           for k, v in props.items()},
+        })
+    for r in path.relationships:
+        edges_out.append({
+            "id": r.element_id,
+            "source": r.start_node.element_id,
+            "target": r.end_node.element_id,
+            "type": r.type,
+            "properties": {k: (str(v) if hasattr(v, "iso_format") or hasattr(v, "to_native") else v)
+                           for k, v in dict(r).items()},
+        })
+
+    return {
+        "found": True,
+        "from": {"entity_type": ft, "identifier": fid},
+        "to": {"entity_type": tt, "identifier": tid},
+        "hop_count": len(edges_out),
+        "nodes": nodes_out,
+        "edges": edges_out,
+    }
+
+
+@app.get("/cases/{case_id}/timeline")
+def get_case_timeline(case_id: str):
+    """
+    Chronological events for a case derived from timestamped evidence:
+    CALLED relationships (calls) and TRANSFERRED relationships (transfers).
+    No fabricated coordinates or events — only what the database stores.
+    """
+    case_id_clean = case_id.strip()
+    if not case_id_clean:
+        raise HTTPException(status_code=400, detail="case_id must not be empty.")
+
+    driver = get_driver()
+    try:
+        with session_scope(driver) as session:
+            calls = session.run(
+                """
+                MATCH (p1:Phone)-[r:CALLED {case_id: $case_id}]->(p2:Phone)
+                RETURN p1.number AS src, p2.number AS dst,
+                       toString(r.timestamp) AS at, r.duration AS duration
+                """,
+                case_id=case_id_clean,
+            ).data()
+            transfers = session.run(
+                """
+                MATCH (a1:Account)-[r:TRANSFERRED {case_id: $case_id}]->(a2:Account)
+                RETURN a1.account_number AS src, a2.account_number AS dst,
+                       toString(r.date) AS at, r.amount AS amount
+                """,
+                case_id=case_id_clean,
+            ).data()
+            locations = session.run(
+                """
+                MATCH (:Case {case_id: $case_id})-[:MENTIONS]->(s:Suspect)
+                      -[o:LOCATED_AT]->(l:Location)
+                RETURN DISTINCT s.name AS suspect, l.name AS location, l.region AS region
+                """,
+                case_id=case_id_clean,
+            ).data()
+    finally:
+        driver.close()
+
+    events = [
+        {"kind": "CALL", "at": c.get("at") or "", "summary": f"{c['src']} → {c['dst']}",
+         "details": {"duration": c.get("duration")}}
+        for c in calls
+    ] + [
+        {"kind": "TRANSFER", "at": t.get("at") or "", "summary": f"{t['src']} → {t['dst']}",
+         "details": {"amount": t.get("amount")}}
+        for t in transfers
+    ]
+    events.sort(key=lambda e: e["at"])
+
     return {
         "case_id": case_id_clean,
-        "rule": f">{burst_call_threshold} calls within the first {burst_window_hours}h, then zero calls after",
-        "flagged_phones": flagged,
+        "event_count": len(events),
+        "events": events,
+        "locations": locations,
     }
+
+
+@app.get("/documents")
+def list_documents(
+    case_id: Optional[str] = None,
+    doc_type: Optional[str] = None,
+    q: Optional[str] = None,
+):
+    """
+    Document/evidence summaries derived from persisted graph data.
+    The backend stores no raw FIR text (parse-only intake); each Case node
+    that carries evidence therefore represents one document entry:
+    FIR evidence (MENTIONS/source_sentence), CDR evidence (CALLED),
+    bank evidence (TRANSFERRED). Filter by case, type, or free text over
+    case IDs and source sentences.
+    """
+    dt = (doc_type or "").strip().upper() or None
+    if dt and dt not in ("FIR", "CDR", "BANK"):
+        raise HTTPException(status_code=400, detail="doc_type must be FIR, CDR or BANK.")
+    needle = (q or "").strip().lower() or None
+    case_filter = (case_id or "").strip() or None
+
+    driver = get_driver()
+    try:
+        with session_scope(driver) as session:
+            if case_filter:
+                case_rows = session.run(
+                    "MATCH (c:Case {case_id: $case_id}) RETURN c.case_id AS case_id, "
+                    "c.description AS description",
+                    case_id=case_filter,
+                ).data()
+            else:
+                case_rows = session.run(
+                    "MATCH (c:Case) RETURN c.case_id AS case_id, "
+                    "c.description AS description ORDER BY c.case_id ASC"
+                ).data()
+
+            docs = []
+            for c in case_rows:
+                cid = c["case_id"]
+                if not cid:
+                    continue
+                stats = session.run(
+                    """
+                    MATCH (c:Case {case_id: $case_id})
+                    OPTIONAL MATCH (c)-[m:MENTIONS]->(s:Suspect)
+                    WITH c, count(DISTINCT s) AS suspects,
+                         collect(DISTINCT m.source_sentence)[0..10] AS sentences
+                    OPTIONAL MATCH (:Phone)-[r1:CALLED {case_id: $case_id}]->(:Phone)
+                    WITH c, suspects, sentences, count(r1) AS calls
+                    OPTIONAL MATCH (:Account)-[r2:TRANSFERRED {case_id: $case_id}]->(:Account)
+                    WITH c, suspects, sentences, calls, count(r2) AS transfers
+                    OPTIONAL MATCH (c)-[:MENTIONS]->(:Suspect)-[o:OWNS]->(p:Phone)
+                    WITH c, suspects, sentences, calls, transfers, count(DISTINCT p) AS phones
+                    OPTIONAL MATCH (c)-[:MENTIONS]->(:Suspect)-[o2:OWNS]->(a:Account)
+                    RETURN suspects, sentences, calls, transfers, phones,
+                           count(DISTINCT a) AS accounts
+                    """,
+                    case_id=cid,
+                ).data()
+                st = stats[0] if stats else {}
+                sentences = [s for s in (st.get("sentences") or []) if s]
+                types = []
+                if (st.get("suspects") or 0) > 0:
+                    types.append("FIR")
+                if (st.get("calls") or 0) > 0:
+                    types.append("CDR")
+                if (st.get("transfers") or 0) > 0:
+                    types.append("BANK")
+                if not types:
+                    # A bare Case node with no persisted evidence is not
+                    # a document — skip it rather than emitting noise.
+                    continue
+                if dt and dt not in types:
+                    continue
+                if needle and needle not in cid.lower() and not any(
+                    needle in s.lower() for s in sentences
+                ):
+                    continue
+                docs.append({
+                    "case_id": cid,
+                    "description": c.get("description"),
+                    "doc_types": types,
+                    "suspect_count": st.get("suspects") or 0,
+                    "phone_count": st.get("phones") or 0,
+                    "account_count": st.get("accounts") or 0,
+                    "call_count": st.get("calls") or 0,
+                    "transfer_count": st.get("transfers") or 0,
+                    "evidence_sentences": sentences,
+                }
+                )
+    finally:
+        driver.close()
+
+    return {"document_count": len(docs), "documents": docs}
+
+
+CROSS_CASE_GLOBAL_QUERY = """
+MATCH (c:Case)-[:MENTIONS]->(s:Suspect)
+WITH s, collect(DISTINCT c.case_id) AS cases
+WHERE size(cases) > 1
+RETURN 'Suspect' AS entityType, s.name AS identifier,
+       cases AS linked_cases, size(cases) AS case_count
+ORDER BY case_count DESC
+UNION ALL
+MATCH (p:Phone)<-[o:OWNS]-(s:Suspect)
+WITH p, collect(DISTINCT o.case_id) AS cases
+WHERE size(cases) > 1
+RETURN 'Phone' AS entityType, p.number AS identifier,
+       cases AS linked_cases, size(cases) AS case_count
+ORDER BY case_count DESC
+UNION ALL
+MATCH (a:Account)<-[o:OWNS]-(s:Suspect)
+WITH a, collect(DISTINCT o.case_id) AS cases
+WHERE size(cases) > 1
+RETURN 'Account' AS entityType, a.account_number AS identifier,
+       cases AS linked_cases, size(cases) AS case_count
+ORDER BY case_count DESC
+"""
+
+
+@app.get("/cross-case")
+def global_cross_case():
+    """
+    Global cross-case intelligence: entities appearing in more than one
+    case. Only relationships supported by the database are reported
+    (Suspects via MENTIONS, Phones/Accounts via OWNS case tags).
+    """
+    driver = get_driver()
+    try:
+        with session_scope(driver) as session:
+            records = session.run(CROSS_CASE_GLOBAL_QUERY).data()
+    finally:
+        driver.close()
+    return {"connection_count": len(records), "connections": records}
+
+
+CYCLE_GLOBAL_QUERY = """
+MATCH path = (start:Account)-[:TRANSFERRED*2..6]->(start)
+WHERE all(i IN range(1, length(path) - 1) WHERE NOT nodes(path)[i] IN nodes(path)[0..i])
+  AND all(n IN nodes(path)[1..-1] WHERE start.account_number < n.account_number)
+WITH [n IN nodes(path) | n.account_number] AS accounts,
+     [rel IN relationships(path) | rel.amount] AS amounts,
+     [rel IN relationships(path) | rel.case_id] AS cases,
+     length(path) AS cycle_length
+RETURN DISTINCT accounts, amounts, cases, cycle_length
+ORDER BY cycle_length ASC
+LIMIT 50
+"""
+
+
+@app.get("/alerts")
+def list_alerts(alert_type: Optional[str] = None):
+    """
+    Centralized alerts aggregated from real backend detections:
+    BURNER (burner-phone rule), CYCLE (money-laundering rings),
+    CROSS_CASE (shared entities). Optional ?alert_type= filter.
+    Severity is rule-derived and documented per alert, never hardcoded
+    per entity.
+    """
+    at = (alert_type or "").strip().upper() or None
+    if at and at not in ("BURNER", "CYCLE", "CROSS_CASE"):
+        raise HTTPException(status_code=400, detail="alert_type must be BURNER, CYCLE or CROSS_CASE.")
+
+    # Single driver + session for the whole aggregation: opening one
+    # driver per case (TLS handshake to AuraDB each time) pushed this
+    # endpoint past proxy timeouts as the case count grew.
+    alerts = []
+    driver = get_driver()
+    try:
+        with session_scope(driver) as session:
+            case_ids = [r["case_id"] for r in session.run(
+                "MATCH (c:Case) RETURN c.case_id AS case_id").data() if r.get("case_id")]
+
+            if at in (None, "BURNER"):
+                for cid in case_ids:
+                    try:
+                        rows = _fetch_cdr_rows(session, cid)
+                    except Exception:
+                        continue
+                    for f in _detect_burners(
+                        rows, BURNER_CALL_COUNT_THRESHOLD, BURNER_WINDOW_HOURS_THRESHOLD
+                    ):
+                        alerts.append({
+                            "alert_type": "BURNER",
+                            "severity": "HIGH",
+                            "case_id": cid,
+                            "entity": f.get("phone_number"),
+                            "reason": f.get("flag_reason"),
+                            "evidence": {"first_call": f.get("first_call"),
+                                         "last_call": f.get("last_call"),
+                                         "total_calls": f.get("total_calls")},
+                        })
+            if at in (None, "CYCLE"):
+                for row in session.run(CYCLE_GLOBAL_QUERY).data():
+                    cases = [c for c in (row.get("cases") or []) if c]
+                    alerts.append({
+                        "alert_type": "CYCLE",
+                        "severity": "HIGH",
+                        "case_id": cases[0] if cases else None,
+                        "entity": " → ".join(row.get("accounts") or []),
+                        "reason": f"Circular fund flow of length {row.get('cycle_length')} detected.",
+                        "evidence": {"accounts": row.get("accounts"), "amounts": row.get("amounts"),
+                                     "cases": cases},
+                    })
+            if at in (None, "CROSS_CASE"):
+                for conn in session.run(CROSS_CASE_GLOBAL_QUERY).data():
+                    cases = conn.get("linked_cases") or []
+                    alerts.append({
+                        "alert_type": "CROSS_CASE",
+                        "severity": "MEDIUM",
+                        "case_id": cases[0] if cases else None,
+                        "entity": conn.get("identifier"),
+                        "reason": f"{conn.get('entityType')} appears in {conn.get('case_count')} cases.",
+                        "evidence": {"cases": cases},
+                    })
+    finally:
+        driver.close()
+
+    return {"alert_count": len(alerts), "alerts": alerts}
 
 
 if __name__ == "__main__":

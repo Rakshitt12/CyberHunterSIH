@@ -12,8 +12,9 @@ def test_health_check():
     response = client.get("/health")
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "ok"
+    assert data["status"] in ("healthy", "degraded")
     assert data["service"] == "ingestion_service"
+    assert data["database"] in ("connected", "disconnected")
 
 
 def test_ingest_fir_txt():

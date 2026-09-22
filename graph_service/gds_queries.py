@@ -140,9 +140,10 @@ ORDER BY case_count DESC
 
 UNION ALL
 
-// Phones used across multiple cases
-MATCH (p:Phone)<-[:OWNS]-(s:Suspect)
-WITH p, collect(DISTINCT s.case_id) AS cases
+// Phones used across multiple cases (case comes from the OWNS
+// relationship tag — Suspect nodes carry no per-case property)
+MATCH (p:Phone)<-[o:OWNS]-(s:Suspect)
+WITH p, collect(DISTINCT o.case_id) AS cases
 WHERE size(cases) > 1
 RETURN
   'Phone'         AS entityType,
@@ -153,9 +154,9 @@ ORDER BY case_count DESC
 
 UNION ALL
 
-// Accounts used across multiple cases
-MATCH (a:Account)<-[:OWNS]-(s:Suspect)
-WITH a, collect(DISTINCT s.case_id) AS cases
+// Accounts used across multiple cases (same OWNS-tag sourcing)
+MATCH (a:Account)<-[o:OWNS]-(s:Suspect)
+WITH a, collect(DISTINCT o.case_id) AS cases
 WHERE size(cases) > 1
 RETURN
   'Account'       AS entityType,
