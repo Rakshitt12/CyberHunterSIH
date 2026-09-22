@@ -188,12 +188,12 @@ export default function GraphVisualizer({
   }, [selectedNodeId]);
 
   return (
-    <div className="relative w-full h-full min-h-[550px] bg-slate-950 rounded-2xl border border-slate-800 overflow-hidden shadow-2xl">
+    <div className="relative w-full h-full min-h-[550px] bg-[#141817] border border-[rgba(200,200,186,0.25)] overflow-hidden">
       <div ref={containerRef} className="w-full h-full min-h-[550px]" />
       
       {/* Legend overlay */}
-      <div className="absolute top-4 left-4 bg-slate-900/90 backdrop-blur-md border border-slate-800 p-3 rounded-xl shadow-lg flex flex-col gap-1.5 text-xs">
-        <span className="font-semibold text-slate-300 text-[11px] uppercase tracking-wider mb-1">
+      <div className="absolute top-4 left-4 bg-[rgba(15,18,17,0.92)] border border-[rgba(200,200,186,0.2)] p-3 shadow-lg flex flex-col gap-1.5 text-xs font-mono">
+        <span className="font-semibold text-[#c8c8ba] text-[10px] uppercase tracking-wider mb-1">
           Entity Types
         </span>
         {Object.entries(NODE_COLORS)
@@ -201,16 +201,17 @@ export default function GraphVisualizer({
           .map(([type, colors]) => (
             <div key={type} className="flex items-center gap-2">
               <span
-                className="w-3 h-3 rounded-full border"
+                className="w-2.5 h-2.5 rounded-full border"
                 style={{ backgroundColor: colors.bg, borderColor: colors.border }}
               />
-              <span className="text-slate-300 text-[11px]">{type}</span>
+              <span className="text-[#8a8d83] text-[10px]">{type}</span>
             </div>
           ))}
       </div>
 
-      <div className="absolute bottom-4 left-4 bg-slate-900/80 backdrop-blur-sm border border-slate-800 px-3 py-1.5 rounded-lg text-[11px] text-slate-400">
-        Tip: Scroll to zoom • Drag to pan • Click node for details
+      <div className="canvas-footer" style={{ position: "absolute", bottom: 0, left: 0, right: 0, background: "rgba(18,21,20,0.9)", borderTop: "1px solid rgba(200,200,186,0.12)" }}>
+        <span>GRAPH INTERACTION: SCROLL ZOOM // DRAG PAN</span>
+        <span>CLICK NODE FOR PROOF-OF-SOURCE</span>
       </div>
     </div>
   );
