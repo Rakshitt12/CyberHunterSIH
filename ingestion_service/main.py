@@ -85,6 +85,40 @@ class ConfirmedEntitiesRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Cases index — list all ingested case IDs
+# ---------------------------------------------------------------------------
+
+@app.get("/cases")
+def list_cases():
+    """
+    Returns a list of all Case nodes in Neo4j, ordered alphabetically by case_id.
+    Used by the dashboard landing page to show the investigator what's already
+    been ingested — so cases never appear to "disappear" after a page reload.
+
+    Response schema:
+      { "cases": [ { "case_id": str, "description": str | null }, ... ] }
+    """
+    driver = get_driver()
+    try:
+        with session_scope(driver) as session:
+            result = session.run(
+                "MATCH (c:Case) RETURN c.case_id AS case_id, c.description AS description "
+                "ORDER BY c.case_id ASC"
+            )
+            cases = [
+                {
+                    "case_id": record["case_id"],
+                    "description": record["description"],
+                }
+                for record in result
+                if record["case_id"]
+            ]
+        return {"cases": cases}
+    finally:
+        driver.close()
+
+
+# ---------------------------------------------------------------------------
 # Health & Status
 # ---------------------------------------------------------------------------
 
@@ -626,7 +660,9 @@ def get_case_analytics(case_id: str):
     
     Note: GDS algorithms (Betweenness, PageRank, Louvain) require Neo4j AuraDB
     Professional/Enterprise with GDS or Aura Graph Analytics. On AuraDB Free,
-    only pure Cypher queries (cycle detection, cross-case linking) are available.
+    the same three measures are computed locally in Python via NetworkX over
+    nodes/edges fetched with plain Cypher (see graph_service.local_analytics).
+    Cycle detection and cross-case linking are pure Cypher and always run.
     """
     case_id_clean = case_id.strip()
     if not case_id_clean:
@@ -635,6 +671,7 @@ def get_case_analytics(case_id: str):
     driver = get_driver()
 
     gds_available = True
+    analytics_engine = "gds"
     betweenness_results = []
     pagerank_results = []
     communities = {}
@@ -701,7 +738,21 @@ def get_case_analytics(case_id: str):
                         "in_this_case": r["identifier"] in case_suspect_names,
                     })
             else:
-                gds_error = "GDS procedures not available on this Neo4j AuraDB tier. Requires AuraDB Professional/Enterprise with GDS or Aura Graph Analytics."
+                # GDS unavailable (e.g. AuraDB Free) — compute the same
+                # measures locally with NetworkX instead of failing.
+                try:
+                    from graph_service.local_analytics import compute_local_analytics
+
+                    betweenness_results, pagerank_results, communities = (
+                        compute_local_analytics(driver, case_id_clean)
+                    )
+                    gds_available = True
+                    analytics_engine = "networkx-local"
+                except Exception as e:
+                    gds_error = (
+                        "GDS procedures not available on this Neo4j AuraDB tier, "
+                        f"and local fallback failed: {e}"
+                    )
 
     finally:
         driver.close()
@@ -746,6 +797,7 @@ def get_case_analytics(case_id: str):
 
     response = {
         "case_id": case_id_clean,
+        "analytics_engine": analytics_engine,
         "betweenness_centrality": betweenness_results,
         "pagerank": pagerank_results,
         "louvain_communities": communities,
