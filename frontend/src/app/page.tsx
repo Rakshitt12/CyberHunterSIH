@@ -172,7 +172,7 @@ export default function DashboardPage() {
         {error && (
           <div className="form-message error m-4 flex items-center gap-2">
             <AlertTriangle size={14} />
-            <span>{error} — Ensure backend ingestion service is running on {API_BASE_URL}</span>
+            <span>{error} — Ensure the backend ingestion service is reachable via /api/* (see next.config.mjs rewrite destination)</span>
           </div>
         )}
 
